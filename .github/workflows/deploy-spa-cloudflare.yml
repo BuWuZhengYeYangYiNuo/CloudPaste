@@ -135,38 +135,85 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           echo "检查并创建 D1 数据库..."
-          DATABASE_LIST=$(npx wrangler d1 list --json 2>/dev/null || echo "[]")
-          EXISTING_DB=$(echo "$DATABASE_LIST" | jq -r '.[] | select(.name=="cloudpaste-db") | .uuid')
+
+          # 1) Fast-fail when secrets missing
+          if [ -z "${CLOUDFLARE_API_TOKEN}" ] || [ -z "${CLOUDFLARE_ACCOUNT_ID}" ]; then
+            echo "❌ 缺少 CLOUDFLARE_API_TOKEN 或 CLOUDFLARE_ACCOUNT_ID，无法继续"
+            exit 1
+          fi
+
+          # 2) 获取 wrangler 列表输出（捕获 stdout/stderr）
+          RAW_LIST=$(npx wrangler d1 list --json 2>&1 || true)
+          echo "===== wrangler d1 list raw output (for debug) ====="
+          echo "$RAW_LIST"
+          echo "===== end raw output ====="
+
+          # 3) 从可能混杂的输出中提取第一个 JSON 数组（从第一个 '[' 到最后的 ']'）
+          LIST_JSON=$(printf '%s' "$RAW_LIST" | tr -d '\r' | sed -n 's/.*\(\[[[:space:][:print:]]*\]\).*/\1/p')
+
+          # 4) 兼容性回退：若未提取到数组，但整个输出以 '[' 开头就使用原始输出
+          if [ -z "$LIST_JSON" ]; then
+            if printf '%s' "$RAW_LIST" | grep -q '^\s*\['; then
+              LIST_JSON="$RAW_LIST"
+            else
+              LIST_JSON="[]"
+            fi
+          fi
+
+          # 5) 验证 JSON 合法性，否则回退为 []
+          if ! printf '%s' "$LIST_JSON" | jq empty >/dev/null 2>&1; then
+            echo "⚠️ 提取到的 D1 列表不是合法 JSON，显示提取结果以供排查："
+            echo "$LIST_JSON"
+            LIST_JSON="[]"
+          fi
+
+          # 6) 查找已有数据库
+          EXISTING_DB=$(printf '%s' "$LIST_JSON" | jq -r '.[] | select(.name=="cloudpaste-db") | .uuid' 2>/dev/null || true)
 
           if [ -n "$EXISTING_DB" ]; then
             echo "✅ 找到现有 D1 数据库: $EXISTING_DB"
             DATABASE_ID=$EXISTING_DB
           else
             echo "创建新的 D1 数据库..."
-            CREATE_OUTPUT=$(npx wrangler d1 create cloudpaste-db 2>&1)
+            CREATE_OUTPUT=$(npx wrangler d1 create cloudpaste-db 2>&1 || true)
+            echo "----- wrangler create output -----"
+            echo "$CREATE_OUTPUT"
+            echo "----- end create output -----"
 
             if echo "$CREATE_OUTPUT" | grep -q "Successfully created DB"; then
-              DATABASE_ID=$(echo "$CREATE_OUTPUT" | grep -oP "database_id = \"\K[^\"]+")
+              DATABASE_ID=$(echo "$CREATE_OUTPUT" | grep -oP 'database_id = "\K[^"]+' || true)
               if [ -z "$DATABASE_ID" ]; then
-                DATABASE_ID=$(echo "$CREATE_OUTPUT" | grep -oP "([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})")
+                DATABASE_ID=$(echo "$CREATE_OUTPUT" | grep -oP '([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})' || true)
               fi
               echo "✅ 数据库创建成功: $DATABASE_ID"
             else
-              LIST_OUTPUT=$(npx wrangler d1 list --json 2>/dev/null || echo "[]")
-              DATABASE_ID=$(echo "$LIST_OUTPUT" | jq -r '.[] | select(.name=="cloudpaste-db") | .uuid')
+              # 再次尝试列出并解析（同样稳健处理）
+              RAW_LIST2=$(npx wrangler d1 list --json 2>&1 || true)
+              LIST_JSON2=$(printf '%s' "$RAW_LIST2" | sed -n 's/.*\(\[[[:space:][:print:]]*\]\).*/\1/p')
+              if [ -z "$LIST_JSON2" ]; then
+                if printf '%s' "$RAW_LIST2" | grep -q '^\s*\['; then
+                  LIST_JSON2="$RAW_LIST2"
+                else
+                  LIST_JSON2="[]"
+                fi
+              fi
+              DATABASE_ID=$(printf '%s' "$LIST_JSON2" | jq -r '.[] | select(.name=="cloudpaste-db") | .uuid' 2>/dev/null || true)
 
               if [ -z "$DATABASE_ID" ]; then
-                echo "❌ 无法创建或找到 D1 数据库"
+                echo "❌ 无法创建或找到 D1 数据库。wrangler 输出如下："
+                echo "---- create output ----"
+                echo "$CREATE_OUTPUT"
+                echo "---- list output fallback ----"
+                echo "$RAW_LIST2"
                 exit 1
               fi
             fi
           fi
 
-          # 更新 wrangler.spa.toml 中的 database_id
+          # 7) 把 database_id 写入 wrangler.spa.toml
           echo "更新 wrangler.spa.toml 中的数据库 ID..."
           sed -i -E "s/(database_id = \")[^\"]+(\"\s*$)/\1$DATABASE_ID\2/" wrangler.spa.toml
 
-          # 验证更新
           if grep -q "$DATABASE_ID" wrangler.spa.toml; then
             echo "✅ wrangler.spa.toml 更新成功"
           else
@@ -212,7 +259,7 @@ jobs:
             if grep -q "^ENCRYPTION_SECRET =" wrangler.spa.toml; then
               sed -i -E "s/^ENCRYPTION_SECRET = \".*\"$/ENCRYPTION_SECRET = \"${ENCRYPTION_ESCAPED}\"/" wrangler.spa.toml
             else
-              sed -i -E "/^\\[vars\\]$/a\\ENCRYPTION_SECRET = \"${ENCRYPTION_ESCAPED}\"" wrangler.spa.toml
+              sed -i -E "/^\[vars\]$/a\ENCRYPTION_SECRET = \"${ENCRYPTION_ESCAPED}\"" wrangler.spa.toml
             fi
             exit 0
           fi
